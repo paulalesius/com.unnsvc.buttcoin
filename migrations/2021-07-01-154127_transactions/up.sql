@@ -1,0 +1,21 @@
+-- Your SQL goes here
+CREATE TABLE transactions (
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  txid VARCHAR(64) NOT NULL,
+  minedtime INTEGER NOT NULL
+);
+
+CREATE TABLE txouts (
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  transactions_id INTEGER NOT NULL,
+  vout INTEGER NOT NULL,
+  wallet_id INTEGER NOT NULL,
+  FOREIGN KEY(transactions_id) REFERENCES transactions(id),
+  FOREIGN KEY(wallet_id) REFERENCES wallet(id)
+);
+
+CREATE TABLE wallet (
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  waddress VARCHAR NOT NULL,
+  balance BIGINT NOT NULL
+);
