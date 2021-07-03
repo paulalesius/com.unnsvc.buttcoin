@@ -10,13 +10,14 @@ use schema::txouts;
 use schema::txouts::dsl::*;
 use schema::wallet;
 use schema::wallet::dsl::*;
+use std::env;
 
 pub struct Database {
     conn: SqliteConnection,
 }
 impl Database {
     pub fn new() -> Self {
-        let conn = SqliteConnection::establish(dotenv!("DATABASE_URL"))
+        let conn = SqliteConnection::establish(env::var("DATABASE_URL").unwrap().as_str())
             .unwrap_or_else(|_| panic!("Error connecting to target/database.db"));
         Database { conn }
     }

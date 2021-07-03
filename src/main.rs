@@ -1,7 +1,5 @@
 #[macro_use]
 extern crate diesel;
-#[macro_use]
-extern crate dotenv_codegen;
 
 mod db;
 use db::*;
@@ -10,29 +8,9 @@ use bitcoin;
 use bitcoin::blockdata::script::Instruction;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use dotenv::dotenv;
-use dotenv_codegen::dotenv;
+use log::{error, info, warn};
+use log4rs;
 use std::env;
-
-struct StdLogger;
-impl log::Log for StdLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.target().contains("jsonrpc") || metadata.target().contains("bitcoincore_rpc")
-    }
-
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            println!(
-                "[{}][{}]: {}",
-                record.level(),
-                record.metadata().target(),
-                record.args()
-            );
-        }
-    }
-
-    fn flush(&self) {}
-}
-static LOGGER: StdLogger = StdLogger;
 
 struct LocalBlock {
     hash: String,
@@ -74,27 +52,27 @@ enum LocalErr {
 }
 
 fn main() {
-    log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(log::LevelFilter::Info))
-        .unwrap();
+    log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+
+    dotenv().ok();
 
     let auth = Auth::UserPass(
-        dotenv!("BITCOINRPC_USER").to_string(),
-        dotenv!("BITCOINRPC_PASS").to_string(),
+        env::var("BITCOINRPC_USER").unwrap().to_string(),
+        env::var("BITCOINRPC_PASS").unwrap().to_string(),
     );
-    let cl = Client::new(dotenv!("BITCOINRPC_URL").to_string(), auth).unwrap();
+    let cl = Client::new(env::var("BITCOINRPC_URL").unwrap().to_string(), auth).unwrap();
     let blocks = cl.get_blockchain_info().unwrap().blocks;
     let db = Database::new();
 
     for i in 0..=blocks {
         match on_block(&db, &cl, i) {
             Ok(local_block) => {
-                println!("Processed: {}", local_block);
+                info!("Processed: {}", local_block);
             }
             Err(local_err) => match local_err {
                 LocalErr::BlockDecodingFailed(block, tx) => {
-                    println!("Failed: {}", block);
-                    println!("           Tx({:?})", tx);
+                    info!("Failed: {}", block);
+                    info!("           Tx({:?})", tx);
                 }
             },
         }
@@ -216,7 +194,7 @@ fn script_to_address_v1(script: &bitcoin::Script) -> Result<bitcoin::Address, ()
             for instr in script.instructions() {
                 match instr.unwrap() {
                     Instruction::Op(op) => {
-                        println!("{}", op);
+                        info!("{}", op);
                     }
                     _ => {}
                 }
