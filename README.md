@@ -1,0 +1,1 @@
+Just an experiment parsing the entire bitcoin blockchain. It uses Bitcoin Core XMLRPC.
