@@ -24,7 +24,9 @@ pub struct Txouts {
     pub id: i32,
     pub transactions_id: i32,
     pub vout: i32,
-    pub wallet_id: i32,
+    pub walletin_id: i32,
+    pub walletout_id: i32,
+    pub balance: i64,
 }
 
 #[derive(Insertable)]
@@ -32,7 +34,9 @@ pub struct Txouts {
 pub struct NewTxouts {
     pub transactions_id: i32,
     pub vout: i32,
-    pub wallet_id: i32,
+    pub walletin_id: i32,
+    pub walletout_id: i32,
+    pub balance: i64,
 }
 
 #[derive(PartialEq, Debug, Deserialize, Queryable, Serialize, Associations, Identifiable)]

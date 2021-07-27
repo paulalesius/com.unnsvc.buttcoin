@@ -2,7 +2,7 @@ refresh_rate: 30 seconds
 appenders:
   stdout:
     kind: console
-  requests:
+  entries:
     kind: file
     path: "target/buttcoin.log"
     encoder:
@@ -11,6 +11,7 @@ root:
   level: warn
   appenders:
     - stdout
+    - entries
 loggers:
   buttcoin:
     level: info

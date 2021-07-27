@@ -11,7 +11,9 @@ table! {
         id -> Integer,
         transactions_id -> Integer,
         vout -> Integer,
-        wallet_id -> Integer,
+        walletin_id -> Integer,
+        walletout_id -> Integer,
+        balance -> BigInt,
     }
 }
 
@@ -24,6 +26,9 @@ table! {
 }
 
 joinable!(txouts -> transactions (transactions_id));
-joinable!(txouts -> wallet (wallet_id));
 
-allow_tables_to_appear_in_same_query!(transactions, txouts, wallet,);
+allow_tables_to_appear_in_same_query!(
+    transactions,
+    txouts,
+    wallet,
+);

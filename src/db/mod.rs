@@ -106,6 +106,7 @@ impl Database {
             .expect("Expected update");
     }
 
+    /***
     pub fn insert_vout(
         &self,
         transid: &String,
@@ -127,7 +128,6 @@ impl Database {
         let txo = NewTxouts {
             transactions_id: tx.id,
             vout: txout_vout,
-            wallet_id: wal.id,
         };
         diesel::insert_into(txouts)
             .values(&txo)
@@ -135,7 +135,7 @@ impl Database {
             .expect("Expected insert vouts");
 
         self.get_txout_by_txn(transid, txout_vout)
-    }
+    }**/
 
     pub fn insert_transaction(&self, transactiondid: &String, time: i32) -> Transactions {
         let tx = NewTransaction {

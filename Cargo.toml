@@ -3,6 +3,10 @@ name = "buttcoin"
 version = "0.1.0"
 edition = "2018"
 
+[[bin]]
+name = "buttcoin"
+src = "src/main.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -19,3 +23,5 @@ diesel = { version="1.1.0", features=["sqlite"] }
 dotenv = "0.15.0"
 dotenv_codegen = "0.15"
 uuid = { version="0.8.2", features=["serde", "v4"] }
+rayon = "1.5.1"
+hashbrown = { version="0.11.2", features=["rayon", "serde"] }
