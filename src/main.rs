@@ -4,14 +4,10 @@ use bitcoin::blockdata::script::Instruction;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use dotenv::dotenv;
 use hashbrown::HashSet;
-use log::{error, info};
+use log::error;
 use log4rs;
-use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
-use std::{
-    env,
-    sync::{RwLockReadGuard, RwLockWriteGuard, LockResult},
-};
+use std::{env, sync::RwLockWriteGuard };
 
 #[derive(Eq, PartialEq)]
 struct Wallet {
@@ -86,7 +82,7 @@ impl<'a> Context<'a> {
 
     fn add_wallet(&'a mut self, address: String) -> &'a Wallet {
         self.wallets.insert(Wallet::new(address.clone()));
-        let existing= self.wallets.get(&Wallet::new(address)).unwrap();
+        let existing = self.wallets.get(&Wallet::new(address)).unwrap();
         return existing;
     }
 
@@ -108,60 +104,46 @@ fn main() {
     let blocks = cl.get_blockchain_info().unwrap().blocks;
     let ctx = Arc::new(RwLock::new(Context::new(cl)));
 
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
-    pool.scope(|s: &rayon::Scope<'static>| {
+    let pool = &rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .unwrap();
+    with_scope(pool, blocks, ctx);
+}
 
-        //let ctx = ctx.clone();
+fn with_scope<'a>(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context<'a>>>) {
+    pool.scope(|s| {
         (0..blocks).for_each(|blocknum| {
-
             let ctx = ctx.clone();
-            let block = ctx.read().unwrap().get_block_by_height(blocknum);
 
-            s.spawn( |s| {
-
-                on_block(s, &block, ctx.clone());
+            s.spawn(move |s1| {
+                let block = ctx.read().unwrap().get_block_by_height(blocknum);
+                on_block(s1, block, ctx.clone());
             });
         });
     });
-
-    /***(0..blocks).par_bridge().for_each(|blocknum| {
-        let ctx = ctx.clone();
-        let block = ctx.read().unwrap().get_block_by_height(blocknum);
-
-        on_block(&block, ctx);
-
-        info!(
-            "Processed block: {} {}/{}",
-            &block.block_hash().to_string(),
-            blocknum,
-            blocks
-        );
-    });**/
 }
 
-fn on_block<'a>(scope: &'a rayon::Scope<'a>, block: &'a bitcoin::Block, ctx: Arc<RwLock<Context<'a>>>) {
-    /***
-    block.txdata.par_iter().for_each(|tx| {
+fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock<Context<'a>>>) {
+    let txdata = block.txdata;
+    for tx in txdata {
         let ctx = ctx.clone();
-        on_transaction(tx, ctx);
-    });**/
-
-    for tx in &block.txdata {
-        scope.spawn( |s1| {
-            on_transaction(s1, tx, ctx.clone());
+        scope.spawn(|s1| {
+            on_transaction(s1, tx, ctx);
         })
     }
 }
 
-fn on_transaction<'a>(scope: &rayon::Scope, tx: &bitcoin::Transaction, ctx: Arc<RwLock<Context<'a>>>) {
+fn on_transaction<'a>(
+    scope: &rayon::Scope<'a>,
+    tx: bitcoin::Transaction,
+    ctx: Arc<RwLock<Context<'a>>>,
+) {
     let mut transaction: Transaction = Transaction::new(tx.txid().to_string());
 
     for (vout, output) in tx.output.iter().enumerate() {
-
         match script_to_wallet(&output.script_pubkey, ctx.clone()) {
-            Ok(wallet) => {
-
-            }
+            Ok(wallet) => {}
             Err(e) => {
                 error!(
                     "Script is not a valid address in transaction: {}; {}",
@@ -175,10 +157,13 @@ fn on_transaction<'a>(scope: &rayon::Scope, tx: &bitcoin::Transaction, ctx: Arc<
     ctx.write().unwrap().add_transaction(transaction);
 }
 
-fn script_to_wallet<'a>(script: &bitcoin::Script, ctx: Arc<RwLock<Context<'a>>>) -> Result<&'a Wallet, String> {
+fn script_to_wallet<'a>(
+    script: &bitcoin::Script,
+    ctx: Arc<RwLock<Context<'a>>>,
+) -> Result<&'a Wallet, String> {
     let address = script_to_p2sh(script)?;
-    let ctxread: RwLockWriteGuard<Context<'a>> = ctx.write().unwrap();
-    let wallet = ctxread.get_wallet(address.clone());
+    let mut ctxread: RwLockWriteGuard<Context<'a>> = ctx.write().unwrap();
+    let wallet: &Wallet = ctxread.get_wallet(address.clone());
     return Ok(wallet);
 }
 
