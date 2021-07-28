@@ -1,13 +1,14 @@
-#![feature(hash_set_entry, unused_imports)]
+#![feature(hash_set_entry)]
 use bitcoin;
 use bitcoin::blockdata::script::Instruction;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use dotenv::dotenv;
 use hashbrown::HashSet;
-use log::error;
+use log::{error, info};
 use log4rs;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
-use std::{env, sync::RwLockWriteGuard };
+use std::{env, sync::RwLockWriteGuard};
 
 #[derive(Eq, PartialEq)]
 struct Wallet {
@@ -25,12 +26,22 @@ impl std::hash::Hash for Wallet {
     }
 }
 
-#[derive(Eq, PartialEq)]
-struct Transaction<'a> {
-    id: String,
-    outs: Vec<(&'a Wallet, u64)>,
+struct Vout {
+    address: String,
+    satoshi: u64,
 }
-impl<'a> Transaction<'a> {
+impl Vout {
+    fn new(address: String, satoshi: u64) -> Self {
+        Vout { address, satoshi }
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct Transaction {
+    id: String,
+    outs: Vec<(Arc<Wallet>, u64)>,
+}
+impl Transaction {
     fn new(id: String) -> Self {
         Transaction {
             id,
@@ -38,11 +49,11 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    fn add_vout(&mut self, wallet: &'a Wallet, value: u64) {
+    fn add_vout(&mut self, wallet: Arc<Wallet>, value: u64) {
         self.outs.push((wallet, value));
     }
 }
-impl<'a> std::hash::Hash for Transaction<'a> {
+impl std::hash::Hash for Transaction {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state);
         state.finish();
@@ -55,12 +66,12 @@ impl From<String> for Wallet {
     }
 }
 
-struct Context<'a> {
+struct Context {
     cl: Client,
-    transactions: HashSet<Transaction<'a>>,
-    wallets: HashSet<Wallet>,
+    transactions: HashSet<Transaction>,
+    wallets: HashSet<Arc<Wallet>>,
 }
-impl<'a> Context<'a> {
+impl Context {
     fn new(cl: Client) -> Self {
         Context {
             cl,
@@ -75,19 +86,19 @@ impl<'a> Context<'a> {
         return block;
     }
 
-    fn get_wallet(&'a mut self, address: String) -> &'a Wallet {
-        let wallet = Wallet::from(address);
-        return self.wallets.get_or_insert(wallet);
-    }
+    fn add_transaction_vouts(&mut self, txid: String, vouts: Vec<Vout>) {
 
-    fn add_wallet(&'a mut self, address: String) -> &'a Wallet {
-        self.wallets.insert(Wallet::new(address.clone()));
-        let existing = self.wallets.get(&Wallet::new(address)).unwrap();
-        return existing;
-    }
+        let mut txn = Transaction::new(txid);
+        for vout in vouts {
 
-    fn add_transaction(&mut self, tx: Transaction<'a>) {
-        self.transactions.insert(tx);
+            let wallet: &Arc<Wallet> = self.wallets.get_or_insert(Arc::new(Wallet::new(vout.address.clone())));
+            txn.add_vout(wallet.clone(), vout.satoshi);
+        }
+
+        //self.transactions.get_or_insert(Transaction::new(txid)).add_vout(wallet.clone(), vout.satoshi);
+        //let mut tx: Transaction = Transaction::new(txid);
+        //tx.add_vout(wallet.clone(), vout.satoshi);
+        //self.transactions.insert(tx);
     }
 }
 
@@ -111,20 +122,21 @@ fn main() {
     with_scope(pool, blocks, ctx);
 }
 
-fn with_scope<'a>(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context<'a>>>) {
+fn with_scope<'a>(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context>>) {
     pool.scope(|s| {
         (0..blocks).for_each(|blocknum| {
             let ctx = ctx.clone();
 
             s.spawn(move |s1| {
                 let block = ctx.read().unwrap().get_block_by_height(blocknum);
-                on_block(s1, block, ctx.clone());
+                on_block(s1, block, ctx);
+                info!("Processed block {}", blocknum);
             });
         });
     });
 }
 
-fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock<Context<'a>>>) {
+fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock<Context>>) {
     let txdata = block.txdata;
     for tx in txdata {
         let ctx = ctx.clone();
@@ -137,34 +149,35 @@ fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock
 fn on_transaction<'a>(
     scope: &rayon::Scope<'a>,
     tx: bitcoin::Transaction,
-    ctx: Arc<RwLock<Context<'a>>>,
+    ctx: Arc<RwLock<Context>>,
 ) {
-    let mut transaction: Transaction = Transaction::new(tx.txid().to_string());
+
+    let mut vouts: Vec<Vout> = Vec::new();
 
     for (vout, output) in tx.output.iter().enumerate() {
-        match script_to_wallet(&output.script_pubkey, ctx.clone()) {
-            Ok(wallet) => {}
+        
+        let ctx = ctx.clone();
+        let txid = tx.txid().to_string();
+
+        match script_to_p2sh(&output.script_pubkey) {
+            Ok(address) => {
+                let vout = Vout::new(address, output.value);
+                vouts.push(vout);
+                //ctx.write().unwrap().add_transaction_vouts(txid, vout);
+            }
             Err(e) => {
                 error!(
                     "Script is not a valid address in transaction: {}; {}",
-                    tx.txid().to_string(),
+                    txid,
                     e
                 );
             }
         }
     }
 
-    ctx.write().unwrap().add_transaction(transaction);
-}
-
-fn script_to_wallet<'a>(
-    script: &bitcoin::Script,
-    ctx: Arc<RwLock<Context<'a>>>,
-) -> Result<&'a Wallet, String> {
-    let address = script_to_p2sh(script)?;
-    let mut ctxread: RwLockWriteGuard<Context<'a>> = ctx.write().unwrap();
-    let wallet: &Wallet = ctxread.get_wallet(address.clone());
-    return Ok(wallet);
+    ctx.write()
+        .unwrap()
+        .add_transaction_vouts(tx.txid().to_string(), vouts);
 }
 
 fn script_to_p2sh(script: &bitcoin::Script) -> Result<String, String> {
