@@ -6,10 +6,10 @@ use dotenv::dotenv;
 use hashbrown::HashSet;
 use log::{error, info};
 use log4rs;
+use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::{env, sync::RwLockWriteGuard};
-use serde::{Serialize, Deserialize};
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
@@ -81,11 +81,11 @@ impl Context {
     }
 
     fn add_transaction_vouts(&mut self, txid: String, vouts: Vec<Vout>) {
-
         let mut txn = Transaction::new(txid);
         for vout in vouts {
-
-            let wallet: &Arc<Wallet> = self.wallets.get_or_insert(Arc::new(Wallet::new(vout.address.clone())));
+            let wallet: &Arc<Wallet> = self
+                .wallets
+                .get_or_insert(Arc::new(Wallet::new(vout.address.clone())));
             txn.add_vout(wallet.clone(), vout.satoshi);
         }
 
@@ -104,16 +104,37 @@ fn main() {
     let auth = Auth::UserPass(user, pass);
     let cl = Client::new(url, auth).unwrap();
     let blocks = cl.get_blockchain_info().unwrap().blocks;
-    let ctx = Arc::new(RwLock::new(Context::new()));
 
     let pool = &rayon::ThreadPoolBuilder::new()
         .num_threads(8)
         .build()
         .unwrap();
-    with_scope(pool, blocks, ctx, &cl);
+    with_scope(pool, blocks, &cl);
 }
 
-fn with_scope(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context>>, cl: &Client) {
+fn with_scope(pool: &rayon::ThreadPool, blocks: u64, cl: &Client) {
+    let ctx: Arc<RwLock<Context>> = match std::fs::File::open("target/ctx.dat") {
+        Ok(file) => {
+            info!("Loading context from disk!");
+            bincode::deserialize_from(file).expect("Deserialization failed")
+        }
+        Err(_) => {
+            info!("Creating a new context!");
+            Arc::new(RwLock::new(Context::new()))
+        }
+    };
+
+    ctrlc::set_handler({
+        let ctx = ctx.clone();
+        move || {
+            info!("Serializing to target/cxt.dat!");
+            let file = std::fs::File::create("target/ctx.dat").expect("Expected file");
+            bincode::serialize_into(file, &ctx).expect("Expected serialization");
+            std::process::exit(1);
+        }
+    })
+    .expect("Expected to set ctrl+c signal");
+
     pool.scope(|s| {
         (0..blocks).for_each(|blocknum| {
             let ctx = ctx.clone();
@@ -130,48 +151,51 @@ fn with_scope(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context>>, 
             });
         });
     });
-
-
-    // Now persist the data
-    let file = std::fs::File::create("target/ctx.dat").expect("Expected file");
-    bincode::serialize_into(file, &ctx).expect("Expected serialization");
 }
 
 fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock<Context>>) {
     let txdata = block.txdata;
     for tx in txdata {
         let ctx = ctx.clone();
-        scope.spawn(|s1| {
-            on_transaction(s1, tx, ctx);
-        })
+        if !ctx
+            .read()
+            .unwrap()
+            .transactions
+            .contains(&Transaction::new(tx.txid().to_string()))
+        {
+            //scope.spawn(|s1| {
+            on_transaction(
+                // s1,
+                tx, ctx,
+            );
+            //})
+        }
     }
 }
 
 fn on_transaction<'a>(
-    scope: &rayon::Scope<'a>,
+    // scope: &rayon::Scope<'a>,
     tx: bitcoin::Transaction,
     ctx: Arc<RwLock<Context>>,
 ) {
-
     let mut vouts: Vec<Vout> = Vec::new();
 
     for (vout, output) in tx.output.iter().enumerate() {
-        
         let ctx = ctx.clone();
         let txid = tx.txid().to_string();
 
         match script_to_p2sh(&output.script_pubkey) {
             Ok(address) => {
+                //info!("Processed wallet addr: {}", address);
                 let vout = Vout::new(address, output.value);
                 vouts.push(vout);
-                //ctx.write().unwrap().add_transaction_vouts(txid, vout);
             }
             Err(e) => {
-                error!(
-                    "Script is not a valid address in transaction: {}; {}",
-                    txid,
-                    e
-                );
+                //error!(
+                //    "Script is not a valid address in transaction: {}; {}",
+                //    txid,
+                //    e
+                //);
             }
         }
     }
@@ -186,7 +210,8 @@ fn script_to_p2sh(script: &bitcoin::Script) -> Result<String, String> {
         Some(address) => Ok(address.to_string()),
         None => {
             // @TODO Attempt to parse the script manually
-            script_to_v0(script)
+            //script_to_v0(script)
+            Err("Failed to parse script".to_string())
         }
     }
 }
