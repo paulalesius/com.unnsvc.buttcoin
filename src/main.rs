@@ -123,10 +123,18 @@ fn with_scope(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context>>, 
                 let block = cl.get_block(&hash).unwrap();
 
                 on_block(s1, block, ctx);
-                info!("Processed block {}", blocknum);
+
+                if (blocknum % 100) == 0 {
+                    info!("Processed block {}", blocknum);
+                }
             });
         });
     });
+
+
+    // Now persist the data
+    let file = std::fs::File::create("target/ctx.dat").expect("Expected file");
+    bincode::serialize_into(file, &ctx).expect("Expected serialization");
 }
 
 fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock<Context>>) {
