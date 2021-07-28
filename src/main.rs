@@ -9,8 +9,9 @@ use log4rs;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::{env, sync::RwLockWriteGuard};
+use serde::{Serialize, Deserialize};
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
     id: String,
 }
@@ -36,7 +37,7 @@ impl Vout {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Transaction {
     id: String,
     outs: Vec<(Arc<Wallet>, u64)>,
@@ -66,24 +67,17 @@ impl From<String> for Wallet {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct Context {
-    cl: Client,
     transactions: HashSet<Transaction>,
     wallets: HashSet<Arc<Wallet>>,
 }
 impl Context {
-    fn new(cl: Client) -> Self {
+    fn new() -> Self {
         Context {
-            cl,
             transactions: HashSet::new(),
             wallets: HashSet::new(),
         }
-    }
-
-    fn get_block_by_height(&self, height: u64) -> bitcoin::Block {
-        let hash = self.cl.get_block_hash(height).unwrap();
-        let block = self.cl.get_block(&hash).unwrap();
-        return block;
     }
 
     fn add_transaction_vouts(&mut self, txid: String, vouts: Vec<Vout>) {
@@ -95,10 +89,7 @@ impl Context {
             txn.add_vout(wallet.clone(), vout.satoshi);
         }
 
-        //self.transactions.get_or_insert(Transaction::new(txid)).add_vout(wallet.clone(), vout.satoshi);
-        //let mut tx: Transaction = Transaction::new(txid);
-        //tx.add_vout(wallet.clone(), vout.satoshi);
-        //self.transactions.insert(tx);
+        self.transactions.insert(txn);
     }
 }
 
@@ -113,22 +104,24 @@ fn main() {
     let auth = Auth::UserPass(user, pass);
     let cl = Client::new(url, auth).unwrap();
     let blocks = cl.get_blockchain_info().unwrap().blocks;
-    let ctx = Arc::new(RwLock::new(Context::new(cl)));
+    let ctx = Arc::new(RwLock::new(Context::new()));
 
     let pool = &rayon::ThreadPoolBuilder::new()
         .num_threads(8)
         .build()
         .unwrap();
-    with_scope(pool, blocks, ctx);
+    with_scope(pool, blocks, ctx, &cl);
 }
 
-fn with_scope<'a>(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context>>) {
+fn with_scope(pool: &rayon::ThreadPool, blocks: u64, ctx: Arc<RwLock<Context>>, cl: &Client) {
     pool.scope(|s| {
         (0..blocks).for_each(|blocknum| {
             let ctx = ctx.clone();
 
             s.spawn(move |s1| {
-                let block = ctx.read().unwrap().get_block_by_height(blocknum);
+                let hash = cl.get_block_hash(blocknum).unwrap();
+                let block = cl.get_block(&hash).unwrap();
+
                 on_block(s1, block, ctx);
                 info!("Processed block {}", blocknum);
             });
