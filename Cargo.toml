@@ -11,7 +11,7 @@ src = "src/main.rs"
 
 [dependencies]
 bitcoincore-rpc = { version="0.13" }
-bitcoin = { version="^0.26.2", features=["use-serde", "rand", "bitcoinconsensus"] }
+bitcoin = { version="^0.27.0", features=["use-serde", "rand", "bitcoinconsensus"] }
 serde = {version = "1.0.126", features = ["rc"]}
 serde_json = "1.0.64"
 serde_derive = "1.0.126"

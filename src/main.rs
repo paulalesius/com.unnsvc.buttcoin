@@ -1,8 +1,10 @@
 #![feature(hash_set_entry)]
-use bitcoin;
-use bitcoin::blockdata::script::Instruction;
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+//use bitcoin::blockdata::script::Instruction;
+//use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc as bitcoin;
+use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
+use hashbrown::HashSet;
 use log::{error, info};
 use log4rs;
 use serde::{Deserialize, Serialize};
@@ -17,16 +19,18 @@ use std::{
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
-    id: String,
+    id: u64,
+    address: String,
 }
 impl Wallet {
-    fn new(id: String) -> Self {
-        Wallet { id }
+    fn new(address: String) -> Self {
+        Wallet { id: 0, address }
     }
 }
+// Don't hash the ID of the wallet, the address is a unique identifier.
 impl std::hash::Hash for Wallet {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.address.hash(state);
         state.finish();
     }
 }
@@ -34,7 +38,7 @@ impl std::hash::Hash for Wallet {
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 enum Vout {
     // Address, satoshis
-    VALID(String, u64),
+    VALID(u64, u64),
     INVALID,
 }
 
@@ -81,10 +85,10 @@ impl Block {
     }
 }
 
-impl From<String> for Wallet {
-    fn from(value: String) -> Self {
-        Wallet::new(value)
-    }
+#[derive(Serialize, Deserialize)]
+struct Segment {
+    id: usize,
+    blocks: Vec<Block>,
 }
 
 fn main() {
@@ -101,11 +105,11 @@ fn main() {
         .build()
         .unwrap();
 
-    let auth = Auth::UserPass(user, pass);
-    let cl = Client::new(url, auth).unwrap();
+    let auth = bitcoin::Auth::UserPass(user, pass);
+    let cl = bitcoin::Client::new(url, auth).unwrap();
     let total_blocks = cl.get_blockchain_info().unwrap().blocks;
     let blocknums = (0..total_blocks).collect::<Vec<u64>>();
-    let ctx = Arc::new(Context::new(total_blocks, 5000000, 10));
+    let ctx = Arc::new(Context::new(total_blocks, 5000000, 1000));
 
     pool.scope(|scope| {
         with_scope(scope, &cl, &blocknums, ctx);
@@ -124,13 +128,11 @@ struct Context {
     // Number of transactions to flush per segment, approximately
     segment_transactions_flush_threshold: u64,
     nr_blocks_processed: Arc<AtomicU64>,
+    wallets: Arc<RwLock<HashSet<Wallet>>>,
+    nr_total_wallets: Arc<AtomicU64>,
 }
 impl Context {
-    fn new(
-        total_blocks: u64,
-        segment_transactions_flush_threshold: u64,
-        chunk_size: u64,
-    ) -> Self {
+    fn new(total_blocks: u64, segment_transactions_flush_threshold: u64, chunk_size: u64) -> Self {
         Context {
             nr_total_blocks: total_blocks,
             processed_blocks: Arc::new(RwLock::new(Vec::new())),
@@ -139,6 +141,8 @@ impl Context {
             chunk_size_in_blocks: chunk_size,
             segment_transactions_flush_threshold,
             nr_blocks_processed: Arc::new(AtomicU64::new(0)),
+            wallets: Arc::new(RwLock::new(HashSet::new())),
+            nr_total_wallets: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -152,6 +156,36 @@ impl Context {
 
     fn get_chunk_size(&self) -> u64 {
         self.chunk_size_in_blocks
+    }
+
+    fn get_id_for_wallet_address(&self, address: String) -> u64 {
+        let mut new_or_existing_wallet = Wallet::new(address);
+
+        let wallet = match self.wallets.read() {
+            Ok(wallets) => match wallets.get(&new_or_existing_wallet) {
+                Some(wallet) => Some(wallet.id),
+                None => None,
+            },
+            Err(_) => None,
+        };
+
+        match wallet {
+            // Wallet found, just return its ID
+            Some(id) => return id,
+            // No wallet found, create new wallet and store it.
+            None => match self.wallets.write() {
+                Ok(mut wallets) => {
+                    let wallet_id = self
+                        .nr_total_wallets
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val + 1))
+                        .unwrap();
+                    new_or_existing_wallet.id = wallet_id;
+                    wallets.insert(new_or_existing_wallet);
+                    wallet_id
+                }
+                Err(e) => panic!("{}", e),
+            },
+        }
     }
 
     fn add_blocks_and_flush(
@@ -207,23 +241,9 @@ impl Context {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Segment {
-    id: usize,
-    blocks: Vec<Block>,
-}
-impl Default for Segment {
-    fn default() -> Self {
-        Segment {
-            id: 0,
-            blocks: Vec::new(),
-        }
-    }
-}
-
 fn with_scope<'a>(
     scope: &rayon::Scope<'a>,
-    cl: &'a Client,
+    cl: &'a bitcoin::Client,
     blocknums: &'a Vec<u64>,
     ctx: Arc<Context>,
 ) {
@@ -236,7 +256,7 @@ fn with_scope<'a>(
                 /***
                  * Fetch chunk
                  */
-                let mut bitcoin_blocks: Vec<bitcoin::Block> = Vec::new();
+                let mut bitcoin_blocks: Vec<bitcoincore_rpc::bitcoin::Block> = Vec::new();
                 let mut processed_transactions = 0;
                 // This is local to every thread execution
                 let mut processed_blocks_local: Vec<Block> = Vec::new();
@@ -254,7 +274,7 @@ fn with_scope<'a>(
                  **/
                 let start_process = Instant::now();
                 bitcoin_blocks.iter().for_each(|block| {
-                    let block = on_block(block);
+                    let block = on_block(ctx.clone(), block);
                     processed_transactions += block.transactions.len();
                     processed_blocks_local.push(block);
                 });
@@ -276,7 +296,6 @@ fn with_scope<'a>(
                     }
                     None => {}
                 }
-
                 let end_flush = Instant::now().duration_since(start_flush);
 
                 info!(
@@ -292,26 +311,26 @@ fn with_scope<'a>(
         });
 }
 
-fn on_block<'a>(block: &bitcoin::Block) -> Block {
+fn on_block<'a>(ctx: Arc<Context>, block: &bitcoincore_rpc::bitcoin::Block) -> Block {
     let mut block_result = Block::new(block.block_hash().to_string());
     let txdata = &block.txdata;
     for tx in txdata {
-        let transaction = on_transaction(tx);
+        let transaction = on_transaction(ctx.clone(), tx);
         block_result.add_transaction(transaction);
     }
 
     block_result
 }
 
-fn on_transaction(tx: &bitcoin::Transaction) -> Transaction {
+fn on_transaction(ctx: Arc<Context>, tx: &bitcoincore_rpc::bitcoin::Transaction) -> Transaction {
     let txid = tx.txid().to_string();
     let mut transaction = Transaction::new(txid);
 
     for output in tx.output.iter() {
         match script_to_p2sh(&output.script_pubkey) {
             Ok(address) => {
-                //info!("Processed wallet addr: {}", address);
-                let vout = Vout::VALID(address, output.value);
+                let id = ctx.get_id_for_wallet_address(address);
+                let vout = Vout::VALID(id, output.value);
                 transaction.add_vout(vout);
             }
             Err(_) => {
@@ -323,8 +342,9 @@ fn on_transaction(tx: &bitcoin::Transaction) -> Transaction {
     transaction
 }
 
-fn script_to_p2sh(script: &bitcoin::Script) -> Result<String, String> {
-    match bitcoin::Address::from_script(script, bitcoin::Network::Bitcoin) {
+fn script_to_p2sh(script: &bitcoincore_rpc::bitcoin::Script) -> Result<String, String> {
+
+    match bitcoin::bitcoin::util::address::Address::from_script(script, bitcoin::bitcoin::Network::Bitcoin) {
         Some(address) => Ok(address.to_string()),
         None => {
             // @TODO Attempt to parse the script manually
@@ -353,11 +373,11 @@ fn script_to_p2sh(script: &bitcoin::Script) -> Result<String, String> {
     }
 }**/
 
-fn script_to_p2pk(script: &bitcoin::Script) -> Result<String, String> {
+fn script_to_p2pk(script: &bitcoincore_rpc::bitcoin::Script) -> Result<String, String> {
     let pubsig: Option<&[u8]> = script
         .instructions()
         .find_map(|instr| match instr.unwrap() {
-            Instruction::PushBytes(bytes) => {
+            bitcoin::bitcoin::blockdata::script::Instruction::PushBytes(bytes) => {
                 return Some(bytes);
             }
             _ => {
@@ -366,9 +386,9 @@ fn script_to_p2pk(script: &bitcoin::Script) -> Result<String, String> {
         });
 
     match pubsig {
-        Some(pub_sig) => match bitcoin::PublicKey::from_slice(pub_sig) {
+        Some(pub_sig) => match bitcoin::bitcoin::PublicKey::from_slice(pub_sig) {
             Ok(pubkey) => {
-                let addr = bitcoin::Address::p2pkh(&pubkey, bitcoin::Network::Bitcoin);
+                let addr = bitcoin::bitcoin::util::address::Address::p2pkh(&pubkey, bitcoin::bitcoin::Network::Bitcoin);
                 return Ok(addr.to_string());
             }
             Err(e) => {
