@@ -19,12 +19,12 @@ use std::{
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
-    id: u64,
+    hash: u64,
     address: String,
 }
 impl Wallet {
-    fn new(address: String) -> Self {
-        Wallet { id: 0, address }
+    fn new(hash: u64, address: String) -> Self {
+        Wallet { hash, address }
     }
 }
 // Don't hash the ID of the wallet, the address is a unique identifier.
@@ -109,7 +109,7 @@ fn main() {
     let cl = bitcoin::Client::new(url, auth).unwrap();
     let total_blocks = cl.get_blockchain_info().unwrap().blocks;
     let blocknums = (0..total_blocks).collect::<Vec<u64>>();
-    let ctx = Arc::new(Context::new(total_blocks, 5000000, 1000));
+    let ctx = Arc::new(Context::new(total_blocks, 8000000, 100, 3000000));
 
     pool.scope(|scope| {
         with_scope(scope, &cl, &blocknums, ctx);
@@ -129,10 +129,14 @@ struct Context {
     segment_transactions_flush_threshold: u64,
     nr_blocks_processed: Arc<AtomicU64>,
     wallets: Arc<RwLock<HashSet<Wallet>>>,
-    nr_total_wallets: Arc<AtomicU64>,
 }
 impl Context {
-    fn new(total_blocks: u64, segment_transactions_flush_threshold: u64, chunk_size: u64) -> Self {
+    fn new(
+        total_blocks: u64,
+        segment_transactions_flush_threshold: u64,
+        chunk_size: u64,
+        wallets_flush_threshold: u64,
+    ) -> Self {
         Context {
             nr_total_blocks: total_blocks,
             processed_blocks: Arc::new(RwLock::new(Vec::new())),
@@ -142,7 +146,6 @@ impl Context {
             segment_transactions_flush_threshold,
             nr_blocks_processed: Arc::new(AtomicU64::new(0)),
             wallets: Arc::new(RwLock::new(HashSet::new())),
-            nr_total_wallets: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -158,34 +161,11 @@ impl Context {
         self.chunk_size_in_blocks
     }
 
-    fn get_id_for_wallet_address(&self, address: String) -> u64 {
-        let mut new_or_existing_wallet = Wallet::new(address);
-
-        let wallet = match self.wallets.read() {
-            Ok(wallets) => match wallets.get(&new_or_existing_wallet) {
-                Some(wallet) => Some(wallet.id),
-                None => None,
-            },
-            Err(_) => None,
-        };
-
-        match wallet {
-            // Wallet found, just return its ID
-            Some(id) => return id,
-            // No wallet found, create new wallet and store it.
-            None => match self.wallets.write() {
-                Ok(mut wallets) => {
-                    let wallet_id = self
-                        .nr_total_wallets
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val + 1))
-                        .unwrap();
-                    new_or_existing_wallet.id = wallet_id;
-                    wallets.insert(new_or_existing_wallet);
-                    wallet_id
-                }
-                Err(e) => panic!("{}", e),
-            },
-        }
+    fn get_hash_for_wallet_address(&self, address: String) -> u64 {
+        let wallet_hash = xxhash_rust::const_xxh3::xxh3_64(address.as_bytes());
+        let wallet = Wallet::new(wallet_hash, address);
+        self.wallets.write().unwrap().insert(wallet);
+        return wallet_hash;
     }
 
     fn add_blocks_and_flush(
@@ -281,31 +261,42 @@ fn with_scope<'a>(
                 let end_process = Instant::now().duration_since(start_process);
 
                 /***
-                 * Now store if necessary, but acquire write lock briefly and perform the flush later so
+                 * Now store to disk, but acquire write lock briefly and perform the flush later so
                  * we don't hold the lock.
                  **/
                 let start_flush = Instant::now();
-                match ctx
-                    .add_blocks_and_flush(processed_blocks_local, processed_transactions as u64)
-                {
-                    Some(segment) => {
-                        let file = File::create(format!("target/data/segment-{}.dat", segment.id))
-                            .expect("Failed to create file");
-                        let writer = BufWriter::new(file);
-                        bincode::serialize_into(writer, &segment).expect("Failed to serialize");
-                    }
-                    None => {}
+                let segment: Option<Segment> =  ctx.add_blocks_and_flush(processed_blocks_local, processed_transactions as u64);
+                if let Some(ref segment) = segment {
+                    let file = File::create(format!("target/data/blocks-{}.dat", segment.id)).expect("Failed to create file");
+                    let writer = BufWriter::new(file);
+                    bincode::serialize_into(writer, segment).expect("Failed to serialize");
                 }
                 let end_flush = Instant::now().duration_since(start_flush);
 
+                /***
+                 * Flush wallets using the same segment ID 
+                 **/
+                let start_wallets = Instant::now();
+                let mut flushed_wallets = 0;
+                if let Some(ref segment) = segment {
+                    let wallets: Vec<Wallet> = ctx.wallets.write().unwrap().drain().collect();
+                    let file = File::create(format!("target/data/wallets-{}.dat", segment.id)).expect("Failed to create file");
+                    let writer = BufWriter::new(file);
+                    bincode::serialize_into(writer, &wallets).expect("Failed to serialize");
+                    flushed_wallets = wallets.len();
+                }
+                let end_wallets = Instant::now().duration_since(start_wallets);
+
                 info!(
-                "Processed blocks {}/{}; Transactions: {}; Fetch: {}ms; Process: {}ms; Flush: {}ms",
+                "Processed blocks {}/{}; Transactions: {}; Fetch: {}ms; Process: {}ms; Flush: {}ms; Wallets ({}): {}ms",
                 ctx.get_nr_blocks_processed(),
                 ctx.get_total_blocks(),
                 processed_transactions,
                 end_fetch.as_millis(),
                 end_process.as_millis(),
                 end_flush.as_millis(),
+                flushed_wallets,
+                end_wallets.as_millis(),
             );
             });
         });
@@ -329,7 +320,7 @@ fn on_transaction(ctx: Arc<Context>, tx: &bitcoincore_rpc::bitcoin::Transaction)
     for output in tx.output.iter() {
         match script_to_p2sh(&output.script_pubkey) {
             Ok(address) => {
-                let id = ctx.get_id_for_wallet_address(address);
+                let id = ctx.get_hash_for_wallet_address(address);
                 let vout = Vout::VALID(id, output.value);
                 transaction.add_vout(vout);
             }
@@ -343,8 +334,10 @@ fn on_transaction(ctx: Arc<Context>, tx: &bitcoincore_rpc::bitcoin::Transaction)
 }
 
 fn script_to_p2sh(script: &bitcoincore_rpc::bitcoin::Script) -> Result<String, String> {
-
-    match bitcoin::bitcoin::util::address::Address::from_script(script, bitcoin::bitcoin::Network::Bitcoin) {
+    match bitcoin::bitcoin::util::address::Address::from_script(
+        script,
+        bitcoin::bitcoin::Network::Bitcoin,
+    ) {
         Some(address) => Ok(address.to_string()),
         None => {
             // @TODO Attempt to parse the script manually
@@ -388,7 +381,10 @@ fn script_to_p2pk(script: &bitcoincore_rpc::bitcoin::Script) -> Result<String, S
     match pubsig {
         Some(pub_sig) => match bitcoin::bitcoin::PublicKey::from_slice(pub_sig) {
             Ok(pubkey) => {
-                let addr = bitcoin::bitcoin::util::address::Address::p2pkh(&pubkey, bitcoin::bitcoin::Network::Bitcoin);
+                let addr = bitcoin::bitcoin::util::address::Address::p2pkh(
+                    &pubkey,
+                    bitcoin::bitcoin::Network::Bitcoin,
+                );
                 return Ok(addr.to_string());
             }
             Err(e) => {
