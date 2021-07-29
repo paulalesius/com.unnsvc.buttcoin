@@ -3,11 +3,17 @@ use bitcoin;
 use bitcoin::blockdata::script::Instruction;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use dotenv::dotenv;
-use log::{info, error};
+use log::{error, info};
 use log4rs;
 use serde::{Deserialize, Serialize};
-use std::{env, fs::File, io::{Write, BufWriter}, sync::atomic::{AtomicU64, AtomicUsize, Ordering}, sync::{Arc, RwLock}, time::{Duration, Instant}};
-use bincode::{Options, DefaultOptions};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Write},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
@@ -99,57 +105,86 @@ fn main() {
     let cl = Client::new(url, auth).unwrap();
     let total_blocks = cl.get_blockchain_info().unwrap().blocks;
     let blocknums = (0..total_blocks).collect::<Vec<u64>>();
-    let nr_processed_blocks = Arc::new(AtomicUsize::new(0));
-    let ctx = Arc::new(Context::new(total_blocks, 10000000, 10));
+    let ctx = Arc::new(Context::new(total_blocks, 5000000, 10));
 
     pool.scope(|scope| {
-        with_scope(scope, &cl, &blocknums, &nr_processed_blocks, ctx);
+        with_scope(scope, &cl, &blocknums, ctx);
     });
 }
 
 struct Context {
     // This is global processed blocks for all thread executions.
     // It will be flushed by individual threads once it fills up.
-    total_blocks: u64,
+    nr_total_blocks: u64,
     processed_blocks: Arc<RwLock<Vec<Block>>>,
     processed_transactions: Arc<AtomicU64>,
     chunk_nr: Arc<AtomicUsize>,
-    chunk_size: u64,
-    processed_transactions_flush_threshold: u64,
+    // The number of blocks to process in a chunk
+    chunk_size_in_blocks: u64,
+    // Number of transactions to flush per segment, approximately
+    segment_transactions_flush_threshold: u64,
+    nr_blocks_processed: Arc<AtomicU64>,
 }
 impl Context {
-    fn new(total_blocks: u64, processed_transactions_flush_threshold: u64, chunk_size: u64) -> Self {
+    fn new(
+        total_blocks: u64,
+        segment_transactions_flush_threshold: u64,
+        chunk_size: u64,
+    ) -> Self {
         Context {
-            total_blocks,
+            nr_total_blocks: total_blocks,
             processed_blocks: Arc::new(RwLock::new(Vec::new())),
             processed_transactions: Arc::new(AtomicU64::new(9)),
             chunk_nr: Arc::new(AtomicUsize::new(0)),
-            chunk_size,
-            processed_transactions_flush_threshold,
+            chunk_size_in_blocks: chunk_size,
+            segment_transactions_flush_threshold,
+            nr_blocks_processed: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn get_total_blocks(&self) -> u64 {
-        self.total_blocks
+        self.nr_total_blocks
+    }
+
+    fn get_nr_blocks_processed(&self) -> u64 {
+        self.nr_blocks_processed.load(Ordering::SeqCst)
     }
 
     fn get_chunk_size(&self) -> u64 {
-        self.chunk_size
+        self.chunk_size_in_blocks
     }
 
-    fn add_blocks_and_flush(&self, processed_blocks: Vec<Block>, processed_transactions: u64) -> Option<Segment> {
-
-        let mut flush : Option<Vec<Block>> = None;
+    fn add_blocks_and_flush(
+        &self,
+        processed_blocks: Vec<Block>,
+        processed_transactions: u64,
+    ) -> Option<Segment> {
+        let mut flush: Option<Vec<Block>> = None;
 
         // Hold the lock for as briefly as possible, only to either add blocks to the global or produce a flush vector.
         match self.processed_blocks.write() {
             Ok(ref mut processed_blocks_global) => {
+                let nr_processed_block_this_chunk = processed_blocks.len();
                 processed_blocks_global.extend(processed_blocks);
-                // If there's more than the flush threshold, then produce a Segment and drain global blocks
-                let nr_blocks_processed = processed_blocks_global.len() as u64;
-                let nr_txns_processed = self.processed_transactions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val + processed_transactions)).unwrap();
 
-                if nr_txns_processed >= self.processed_transactions_flush_threshold || nr_blocks_processed == self.total_blocks {
+                // If there's more than the flush threshold, then produce a Segment and drain global blocks
+                let nr_blocks_processed = self
+                    .nr_blocks_processed
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
+                        Some(val + nr_processed_block_this_chunk as u64)
+                    })
+                    .unwrap();
+                let nr_txns_processed = self
+                    .processed_transactions
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
+                        Some(val + processed_transactions)
+                    })
+                    .unwrap();
+
+                // If segment transactions threshold is reached, or if total blocks is reached
+                if nr_txns_processed >= self.segment_transactions_flush_threshold
+                    || nr_blocks_processed == self.get_total_blocks()
+                {
                     flush = Some(processed_blocks_global.drain(0..).collect::<Vec<Block>>());
                     self.processed_transactions.store(0, Ordering::SeqCst);
                 }
@@ -158,8 +193,14 @@ impl Context {
         };
 
         if let Some(flush) = flush {
-            let chunknr = self.chunk_nr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v + 1)).unwrap();
-            return Some(Segment{id: chunknr, blocks: flush});
+            let chunknr = self
+                .chunk_nr
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v + 1))
+                .unwrap();
+            return Some(Segment {
+                id: chunknr,
+                blocks: flush,
+            });
         }
 
         None
@@ -169,77 +210,86 @@ impl Context {
 #[derive(Serialize, Deserialize)]
 struct Segment {
     id: usize,
-    blocks: Vec<Block>
+    blocks: Vec<Block>,
+}
+impl Default for Segment {
+    fn default() -> Self {
+        Segment {
+            id: 0,
+            blocks: Vec::new(),
+        }
+    }
 }
 
 fn with_scope<'a>(
     scope: &rayon::Scope<'a>,
     cl: &'a Client,
     blocknums: &'a Vec<u64>,
-    nr_processed_blocks: &'a Arc<AtomicUsize>,
-    ctx: Arc<Context>
+    ctx: Arc<Context>,
 ) {
+    blocknums
+        .chunks(ctx.get_chunk_size() as usize)
+        .for_each(|chunk| {
+            let ctx = ctx.clone();
 
-    blocknums.chunks(ctx.get_chunk_size() as usize).for_each(|chunk| {
-        
-        let ctx = ctx.clone();
+            scope.spawn(move |_| {
+                /***
+                 * Fetch chunk
+                 */
+                let mut bitcoin_blocks: Vec<bitcoin::Block> = Vec::new();
+                let mut processed_transactions = 0;
+                // This is local to every thread execution
+                let mut processed_blocks_local: Vec<Block> = Vec::new();
 
-        scope.spawn(move |_| {
-            /***
-             * Fetch chunk
-             */
-            let mut bitcoin_blocks: Vec<bitcoin::Block> = Vec::new();
-            let mut processed_transactions = 0;
-            // This is local to every thread execution
-            let mut processed_blocks_local: Vec<Block> = Vec::new();
+                let start_fetch = Instant::now();
+                chunk.iter().for_each(|blocknum| {
+                    let hash = cl.get_block_hash(blocknum.to_owned()).unwrap();
+                    let block = cl.get_block(&hash).unwrap();
+                    bitcoin_blocks.push(block);
+                });
+                let end_fetch = Instant::now().duration_since(start_fetch);
 
-            let start_fetch = Instant::now();
-            chunk.iter().for_each(|blocknum| {
-                let hash = cl.get_block_hash(blocknum.to_owned()).unwrap();
-                let block = cl.get_block(&hash).unwrap();
-                bitcoin_blocks.push(block);
-            });
-            let end_fetch = Instant::now().duration_since(start_fetch);
+                /***
+                 * Process chunk
+                 **/
+                let start_process = Instant::now();
+                bitcoin_blocks.iter().for_each(|block| {
+                    let block = on_block(block);
+                    processed_transactions += block.transactions.len();
+                    processed_blocks_local.push(block);
+                });
+                let end_process = Instant::now().duration_since(start_process);
 
-            /***
-             * Process chunk
-             **/
-            let start_process = Instant::now();
-            bitcoin_blocks.iter().for_each(|block| {
-                let block = on_block(block);
-                processed_transactions += block.transactions.len();
-                processed_blocks_local.push(block);
-            });
-            let end_process = Instant::now().duration_since(start_process);
-
-            /***
-             * Now store if necessary, but acquire write lock briefly and perform the flush later so
-             * we don't hold the lock.
-             **/
-            let start_flush = Instant::now();
-            match ctx.add_blocks_and_flush(processed_blocks_local, processed_transactions as u64) {
-                Some(segment) => {
-                    let file = File::create(format!("target/data/segment-{}.dat", segment.id)).expect("Failed to create file");
-                    let writer = BufWriter::new(file);
-                    bincode::serialize_into(writer, &segment).expect("Failed to serialize");
+                /***
+                 * Now store if necessary, but acquire write lock briefly and perform the flush later so
+                 * we don't hold the lock.
+                 **/
+                let start_flush = Instant::now();
+                match ctx
+                    .add_blocks_and_flush(processed_blocks_local, processed_transactions as u64)
+                {
+                    Some(segment) => {
+                        let file = File::create(format!("target/data/segment-{}.dat", segment.id))
+                            .expect("Failed to create file");
+                        let writer = BufWriter::new(file);
+                        bincode::serialize_into(writer, &segment).expect("Failed to serialize");
+                    }
+                    None => {}
                 }
-                None => {}
-            }
 
-            let end_flush = Instant::now().duration_since(start_flush);
+                let end_flush = Instant::now().duration_since(start_flush);
 
-            nr_processed_blocks.fetch_add(chunk.len(), Ordering::SeqCst);
-            info!(
+                info!(
                 "Processed blocks {}/{}; Transactions: {}; Fetch: {}ms; Process: {}ms; Flush: {}ms",
-                nr_processed_blocks.load(Ordering::SeqCst),
+                ctx.get_nr_blocks_processed(),
                 ctx.get_total_blocks(),
                 processed_transactions,
                 end_fetch.as_millis(),
                 end_process.as_millis(),
                 end_flush.as_millis(),
             );
+            });
         });
-    });
 }
 
 fn on_block<'a>(block: &bitcoin::Block) -> Block {
