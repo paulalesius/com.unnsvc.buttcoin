@@ -43,14 +43,32 @@ enum Vout {
 }
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
+struct Vin {
+    txid_hash: u64,
+    vout_idx: u32,
+}
+impl Vin {
+    fn new(txid_hash: u64, vout_idx: u32) -> Self {
+        Vin {
+            txid_hash,
+            vout_idx,
+        }
+    }
+}
+
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Transaction {
-    id: String,
+    hash: u64,
+    txid: String,
+    vins: Vec<Vin>,
     vouts: Vec<Vout>,
 }
 impl Transaction {
-    fn new(id: String) -> Self {
+    fn new(hash: u64, txid: String) -> Self {
         Transaction {
-            id,
+            hash,
+            txid,
+            vins: Vec::new(),
             vouts: Vec::new(),
         }
     }
@@ -58,24 +76,30 @@ impl Transaction {
     fn add_vout(&mut self, vout: Vout) {
         self.vouts.push(vout);
     }
+
+    fn add_vin(&mut self, vin: Vin) {
+        self.vins.push(vin);
+    }
 }
 impl std::hash::Hash for Transaction {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.txid.hash(state);
         state.finish();
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Block {
-    id: String,
+    timestamp: u32,
+    hash: String,
     transactions: Vec<Transaction>,
 }
 
 impl Block {
-    fn new(id: String) -> Self {
+    fn new(hash: String, timestamp: u32) -> Self {
         Block {
-            id,
+            timestamp,
+            hash,
             transactions: Vec::new(),
         }
     }
@@ -303,7 +327,7 @@ fn with_scope<'a>(
 }
 
 fn on_block<'a>(ctx: Arc<Context>, block: &bitcoincore_rpc::bitcoin::Block) -> Block {
-    let mut block_result = Block::new(block.block_hash().to_string());
+    let mut block_result = Block::new(block.block_hash().to_string(), block.header.time);
     let txdata = &block.txdata;
     for tx in txdata {
         let transaction = on_transaction(ctx.clone(), tx);
@@ -315,7 +339,19 @@ fn on_block<'a>(ctx: Arc<Context>, block: &bitcoincore_rpc::bitcoin::Block) -> B
 
 fn on_transaction(ctx: Arc<Context>, tx: &bitcoincore_rpc::bitcoin::Transaction) -> Transaction {
     let txid = tx.txid().to_string();
-    let mut transaction = Transaction::new(txid);
+    let hash = xxhash_rust::const_xxh3::xxh3_64(txid.as_bytes());
+    let mut transaction = Transaction::new(hash, txid);
+
+    // Don't store coinbase transactions as they all originate from the aether and not an input wallet
+    if !tx.is_coin_base() {
+        for input in tx.input.iter() {
+            let prev_out = input.previous_output;
+            let txid = prev_out.txid.to_string();
+            let hash = xxhash_rust::const_xxh3::xxh3_64(txid.as_bytes());
+            let vout_idx = prev_out.vout;
+            transaction.add_vin(Vin::new(hash, vout_idx));
+        }
+    }
 
     for output in tx.output.iter() {
         match script_to_p2sh(&output.script_pubkey) {
