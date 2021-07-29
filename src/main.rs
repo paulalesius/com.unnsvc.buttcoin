@@ -10,6 +10,7 @@ use std::{
     env,
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
@@ -106,26 +107,52 @@ fn main() {
     });
 }
 
-fn with_scope<'a>(scope: &rayon::Scope<'a>, blocks: u64, cl: &'a Client, blocknums: &'a Vec<u64>, processed: &'a Arc<AtomicUsize>) {
-
-    blocknums.chunks(1000).for_each(|chunk| {
+fn with_scope<'a>(
+    scope: &rayon::Scope<'a>,
+    blocks: u64,
+    cl: &'a Client,
+    blocknums: &'a Vec<u64>,
+    processed: &'a Arc<AtomicUsize>,
+) {
+    blocknums.chunks(10000).for_each(|chunk| {
         scope.spawn(move |_| {
             // For each chunk
+            let mut bitcoin_blocks: Vec<bitcoin::Block> = Vec::new();
+            let mut processed_transactions = 0;
+
+            let start_fetch = Instant::now();
             chunk.iter().for_each(|blocknum| {
                 let hash = cl.get_block_hash(blocknum.to_owned()).unwrap();
                 let block = cl.get_block(&hash).unwrap();
-                let block = on_block(block);
+                bitcoin_blocks.push(block);
             });
+            let end_fetch = Instant::now().duration_since(start_fetch);
+
+            // Process
+            let start_process = Instant::now();
+            bitcoin_blocks.iter().for_each(|block| {
+                let block = on_block(block);
+                processed_transactions += block.transactions.len();
+                // @TODO do something with block
+            });
+            let end_process = Instant::now().duration_since(start_process);
 
             processed.fetch_add(chunk.len(), Ordering::SeqCst);
-            info!("Processed {}/{} blocks.", processed.load(Ordering::SeqCst), blocks);
+            info!(
+                "Processed {}/{} blocks {} transactions. Fetch: {}ms Process: {}ms",
+                processed.load(Ordering::SeqCst),
+                blocks,
+                processed_transactions,
+                end_fetch.as_millis(),
+                end_process.as_millis()
+            );
         });
     });
 }
 
-fn on_block<'a>(block: bitcoin::Block) -> Block {
+fn on_block<'a>(block: &bitcoin::Block) -> Block {
     let mut block_result = Block::new(block.block_hash().to_string());
-    let txdata = block.txdata;
+    let txdata = &block.txdata;
     for tx in txdata {
         let transaction = on_transaction(tx);
         block_result.add_transaction(transaction);
@@ -134,7 +161,7 @@ fn on_block<'a>(block: bitcoin::Block) -> Block {
     block_result
 }
 
-fn on_transaction(tx: bitcoin::Transaction) -> Transaction {
+fn on_transaction(tx: &bitcoin::Transaction) -> Transaction {
     let txid = tx.txid().to_string();
     let mut transaction = Transaction::new(txid);
 
