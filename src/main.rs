@@ -3,14 +3,15 @@ use bitcoin;
 use bitcoin::blockdata::script::Instruction;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use dotenv::dotenv;
-use log::info;
+use log::{info, error};
 use log4rs;
 use serde::{Deserialize, Serialize};
 use std::{
     env,
     sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
+    fs::File,
 };
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
@@ -60,6 +61,7 @@ impl std::hash::Hash for Transaction {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct Block {
     id: String,
     transactions: Vec<Transaction>,
@@ -100,25 +102,95 @@ fn main() {
     let cl = Client::new(url, auth).unwrap();
     let total_blocks = cl.get_blockchain_info().unwrap().blocks;
     let blocknums = (0..total_blocks).collect::<Vec<u64>>();
-    let processed = Arc::new(AtomicUsize::new(0));
+    let nr_processed_blocks = Arc::new(AtomicUsize::new(0));
+    let ctx = Arc::new(Context::new(total_blocks, 10000, 10));
 
     pool.scope(|scope| {
-        with_scope(scope, total_blocks, &cl, &blocknums, &processed);
+        with_scope(scope, &cl, &blocknums, &nr_processed_blocks, ctx);
     });
+}
+
+struct Context {
+    // This is global processed blocks for all thread executions.
+    // It will be flushed by individual threads once it fills up.
+    total_blocks: u64,
+    processed_blocks: Arc<RwLock<Vec<Block>>>,
+    chunk_nr: Arc<AtomicUsize>,
+    flush_threshold: u64,
+    chunk_size: u64,
+}
+impl Context {
+    fn new(total_blocks: u64, flush_threshold: u64, chunk_size: u64) -> Self {
+        Context {
+            total_blocks,
+            processed_blocks: Arc::new(RwLock::new(Vec::new())),
+            chunk_nr: Arc::new(AtomicUsize::new(0)),
+            flush_threshold,
+            chunk_size,
+        }
+    }
+
+    fn get_total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn get_chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
+
+    fn add_blocks_and_flush(&self, processed_blocks: Vec<Block>) -> Option<Segment> {
+
+        let mut flush : Option<Vec<Block>> = None;
+
+        // Hold the lock for as briefly as possible, only to either add blocks to the global or produce a flush vector.
+        match self.processed_blocks.write() {
+            Ok(ref mut processed_blocks_global) => {
+                processed_blocks_global.extend(processed_blocks);
+
+                // If there's more than the flush threshold, then produce a Segment and drain global blocks
+                let nr_processed = processed_blocks_global.len() as u64;
+                if nr_processed > self.flush_threshold || nr_processed == self.total_blocks {
+                    flush = Some(processed_blocks_global.drain(0..).collect::<Vec<Block>>());
+                }
+            }
+            Err(_) => {}
+        };
+
+        if let Some(flush) = flush {
+            let chunknr = self.chunk_nr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v + 1)).unwrap();
+            return Some(Segment{id: chunknr, blocks: flush});
+        }
+
+        None
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Segment {
+    id: usize,
+    blocks: Vec<Block>
 }
 
 fn with_scope<'a>(
     scope: &rayon::Scope<'a>,
-    blocks: u64,
     cl: &'a Client,
     blocknums: &'a Vec<u64>,
-    processed: &'a Arc<AtomicUsize>,
+    nr_processed_blocks: &'a Arc<AtomicUsize>,
+    ctx: Arc<Context>
 ) {
-    blocknums.chunks(10000).for_each(|chunk| {
+
+    blocknums.chunks(ctx.get_chunk_size() as usize).for_each(|chunk| {
+        
+        let ctx = ctx.clone();
+
         scope.spawn(move |_| {
-            // For each chunk
+            /***
+             * Fetch chunk
+             */
             let mut bitcoin_blocks: Vec<bitcoin::Block> = Vec::new();
             let mut processed_transactions = 0;
+            // This is local to every thread execution
+            let mut processed_blocks_local: Vec<Block> = Vec::new();
 
             let start_fetch = Instant::now();
             chunk.iter().for_each(|blocknum| {
@@ -128,23 +200,41 @@ fn with_scope<'a>(
             });
             let end_fetch = Instant::now().duration_since(start_fetch);
 
-            // Process
+            /***
+             * Process chunk
+             **/
             let start_process = Instant::now();
             bitcoin_blocks.iter().for_each(|block| {
                 let block = on_block(block);
                 processed_transactions += block.transactions.len();
-                // @TODO do something with block
+                processed_blocks_local.push(block);
             });
             let end_process = Instant::now().duration_since(start_process);
 
-            processed.fetch_add(chunk.len(), Ordering::SeqCst);
+            /***
+             * Now store if necessary, but acquire write lock briefly and perform the flush later so
+             * we don't hold the lock.
+             **/
+            let start_flush = Instant::now();
+            match ctx.add_blocks_and_flush(processed_blocks_local) {
+                Some(segment) => {
+                    let file = File::create(format!("target/segment-{}.dat", segment.id)).expect("Failed to create file");
+                    bincode::serialize_into(file, &segment).expect("Failed to serialize");
+                }
+                None => {}
+            }
+
+            let end_flush = Instant::now().duration_since(start_flush);
+
+            nr_processed_blocks.fetch_add(chunk.len(), Ordering::SeqCst);
             info!(
-                "Processed {}/{} blocks {} transactions. Fetch: {}ms Process: {}ms",
-                processed.load(Ordering::SeqCst),
-                blocks,
+                "Processed blocks {}/{}; Transactions: {}; Fetch: {}ms; Process: {}ms; Flush: {}ms",
+                nr_processed_blocks.load(Ordering::SeqCst),
+                ctx.get_total_blocks(),
                 processed_transactions,
                 end_fetch.as_millis(),
-                end_process.as_millis()
+                end_process.as_millis(),
+                end_flush.as_millis(),
             );
         });
     });

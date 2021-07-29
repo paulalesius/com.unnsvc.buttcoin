@@ -11,7 +11,7 @@ root:
   level: warn
   appenders:
     - stdout
-    - entries
+#   - entries
 loggers:
   buttcoin:
     level: info
