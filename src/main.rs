@@ -6,13 +6,8 @@ use dotenv::dotenv;
 use log::{info, error};
 use log4rs;
 use serde::{Deserialize, Serialize};
-use std::{
-    env,
-    sync::atomic::{AtomicUsize, Ordering},
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-    fs::File,
-};
+use std::{env, fs::File, io::{Write, BufWriter}, sync::atomic::{AtomicU64, AtomicUsize, Ordering}, sync::{Arc, RwLock}, time::{Duration, Instant}};
+use bincode::{Options, DefaultOptions};
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
@@ -89,6 +84,8 @@ impl From<String> for Wallet {
 fn main() {
     log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
     dotenv().ok();
+    // Create dir to store data in
+    std::fs::create_dir_all("target/data").unwrap();
 
     let user = env::var("BITCOINRPC_USER").unwrap().to_string();
     let pass = env::var("BITCOINRPC_PASS").unwrap().to_string();
@@ -103,7 +100,7 @@ fn main() {
     let total_blocks = cl.get_blockchain_info().unwrap().blocks;
     let blocknums = (0..total_blocks).collect::<Vec<u64>>();
     let nr_processed_blocks = Arc::new(AtomicUsize::new(0));
-    let ctx = Arc::new(Context::new(total_blocks, 10000, 10));
+    let ctx = Arc::new(Context::new(total_blocks, 10000000, 10));
 
     pool.scope(|scope| {
         with_scope(scope, &cl, &blocknums, &nr_processed_blocks, ctx);
@@ -115,18 +112,20 @@ struct Context {
     // It will be flushed by individual threads once it fills up.
     total_blocks: u64,
     processed_blocks: Arc<RwLock<Vec<Block>>>,
+    processed_transactions: Arc<AtomicU64>,
     chunk_nr: Arc<AtomicUsize>,
-    flush_threshold: u64,
     chunk_size: u64,
+    processed_transactions_flush_threshold: u64,
 }
 impl Context {
-    fn new(total_blocks: u64, flush_threshold: u64, chunk_size: u64) -> Self {
+    fn new(total_blocks: u64, processed_transactions_flush_threshold: u64, chunk_size: u64) -> Self {
         Context {
             total_blocks,
             processed_blocks: Arc::new(RwLock::new(Vec::new())),
+            processed_transactions: Arc::new(AtomicU64::new(9)),
             chunk_nr: Arc::new(AtomicUsize::new(0)),
-            flush_threshold,
             chunk_size,
+            processed_transactions_flush_threshold,
         }
     }
 
@@ -138,7 +137,7 @@ impl Context {
         self.chunk_size
     }
 
-    fn add_blocks_and_flush(&self, processed_blocks: Vec<Block>) -> Option<Segment> {
+    fn add_blocks_and_flush(&self, processed_blocks: Vec<Block>, processed_transactions: u64) -> Option<Segment> {
 
         let mut flush : Option<Vec<Block>> = None;
 
@@ -146,11 +145,13 @@ impl Context {
         match self.processed_blocks.write() {
             Ok(ref mut processed_blocks_global) => {
                 processed_blocks_global.extend(processed_blocks);
-
                 // If there's more than the flush threshold, then produce a Segment and drain global blocks
-                let nr_processed = processed_blocks_global.len() as u64;
-                if nr_processed > self.flush_threshold || nr_processed == self.total_blocks {
+                let nr_blocks_processed = processed_blocks_global.len() as u64;
+                let nr_txns_processed = self.processed_transactions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val + processed_transactions)).unwrap();
+
+                if nr_txns_processed >= self.processed_transactions_flush_threshold || nr_blocks_processed == self.total_blocks {
                     flush = Some(processed_blocks_global.drain(0..).collect::<Vec<Block>>());
+                    self.processed_transactions.store(0, Ordering::SeqCst);
                 }
             }
             Err(_) => {}
@@ -216,10 +217,11 @@ fn with_scope<'a>(
              * we don't hold the lock.
              **/
             let start_flush = Instant::now();
-            match ctx.add_blocks_and_flush(processed_blocks_local) {
+            match ctx.add_blocks_and_flush(processed_blocks_local, processed_transactions as u64) {
                 Some(segment) => {
-                    let file = File::create(format!("target/segment-{}.dat", segment.id)).expect("Failed to create file");
-                    bincode::serialize_into(file, &segment).expect("Failed to serialize");
+                    let file = File::create(format!("target/data/segment-{}.dat", segment.id)).expect("Failed to create file");
+                    let writer = BufWriter::new(file);
+                    bincode::serialize_into(writer, &segment).expect("Failed to serialize");
                 }
                 None => {}
             }
