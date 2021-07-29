@@ -3,13 +3,14 @@ use bitcoin;
 use bitcoin::blockdata::script::Instruction;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use dotenv::dotenv;
-use hashbrown::HashSet;
-use log::{error, info};
+use log::info;
 use log4rs;
 use serde::{Deserialize, Serialize};
-use std::rc::Rc;
-use std::sync::{Arc, RwLock};
-use std::{env, sync::RwLockWriteGuard};
+use std::{
+    env,
+    sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
+};
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Wallet {
@@ -27,31 +28,28 @@ impl std::hash::Hash for Wallet {
     }
 }
 
-struct Vout {
-    address: String,
-    satoshi: u64,
-}
-impl Vout {
-    fn new(address: String, satoshi: u64) -> Self {
-        Vout { address, satoshi }
-    }
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
+enum Vout {
+    // Address, satoshis
+    VALID(String, u64),
+    INVALID,
 }
 
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct Transaction {
     id: String,
-    outs: Vec<(Arc<Wallet>, u64)>,
+    vouts: Vec<Vout>,
 }
 impl Transaction {
     fn new(id: String) -> Self {
         Transaction {
             id,
-            outs: Vec::new(),
+            vouts: Vec::new(),
         }
     }
 
-    fn add_vout(&mut self, wallet: Arc<Wallet>, value: u64) {
-        self.outs.push((wallet, value));
+    fn add_vout(&mut self, vout: Vout) {
+        self.vouts.push(vout);
     }
 }
 impl std::hash::Hash for Transaction {
@@ -61,35 +59,27 @@ impl std::hash::Hash for Transaction {
     }
 }
 
+struct Block {
+    id: String,
+    transactions: Vec<Transaction>,
+}
+
+impl Block {
+    fn new(id: String) -> Self {
+        Block {
+            id,
+            transactions: Vec::new(),
+        }
+    }
+
+    fn add_transaction(&mut self, transaction: Transaction) {
+        self.transactions.push(transaction);
+    }
+}
+
 impl From<String> for Wallet {
     fn from(value: String) -> Self {
         Wallet::new(value)
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Context {
-    transactions: HashSet<Transaction>,
-    wallets: HashSet<Arc<Wallet>>,
-}
-impl Context {
-    fn new() -> Self {
-        Context {
-            transactions: HashSet::new(),
-            wallets: HashSet::new(),
-        }
-    }
-
-    fn add_transaction_vouts(&mut self, txid: String, vouts: Vec<Vout>) {
-        let mut txn = Transaction::new(txid);
-        for vout in vouts {
-            let wallet: &Arc<Wallet> = self
-                .wallets
-                .get_or_insert(Arc::new(Wallet::new(vout.address.clone())));
-            txn.add_vout(wallet.clone(), vout.satoshi);
-        }
-
-        self.transactions.insert(txn);
     }
 }
 
@@ -100,109 +90,68 @@ fn main() {
     let user = env::var("BITCOINRPC_USER").unwrap().to_string();
     let pass = env::var("BITCOINRPC_PASS").unwrap().to_string();
     let url = env::var("BITCOINRPC_URL").unwrap().to_string();
-
-    let auth = Auth::UserPass(user, pass);
-    let cl = Client::new(url, auth).unwrap();
-    let blocks = cl.get_blockchain_info().unwrap().blocks;
-
     let pool = &rayon::ThreadPoolBuilder::new()
         .num_threads(8)
         .build()
         .unwrap();
-    with_scope(pool, blocks, &cl);
+
+    let auth = Auth::UserPass(user, pass);
+    let cl = Client::new(url, auth).unwrap();
+    let total_blocks = cl.get_blockchain_info().unwrap().blocks;
+    let blocknums = (0..total_blocks).collect::<Vec<u64>>();
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    pool.scope(|scope| {
+        with_scope(scope, total_blocks, &cl, &blocknums, &processed);
+    });
 }
 
-fn with_scope(pool: &rayon::ThreadPool, blocks: u64, cl: &Client) {
-    let ctx: Arc<RwLock<Context>> = match std::fs::File::open("target/ctx.dat") {
-        Ok(file) => {
-            info!("Loading context from disk!");
-            bincode::deserialize_from(file).expect("Deserialization failed")
-        }
-        Err(_) => {
-            info!("Creating a new context!");
-            Arc::new(RwLock::new(Context::new()))
-        }
-    };
+fn with_scope<'a>(scope: &rayon::Scope<'a>, blocks: u64, cl: &'a Client, blocknums: &'a Vec<u64>, processed: &'a Arc<AtomicUsize>) {
 
-    ctrlc::set_handler({
-        let ctx = ctx.clone();
-        move || {
-            info!("Serializing to target/cxt.dat!");
-            let file = std::fs::File::create("target/ctx.dat").expect("Expected file");
-            bincode::serialize_into(file, &ctx).expect("Expected serialization");
-            std::process::exit(1);
-        }
-    })
-    .expect("Expected to set ctrl+c signal");
-
-    pool.scope(|s| {
-        (0..blocks).for_each(|blocknum| {
-            let ctx = ctx.clone();
-
-            s.spawn(move |s1| {
-                let hash = cl.get_block_hash(blocknum).unwrap();
+    blocknums.chunks(1000).for_each(|chunk| {
+        scope.spawn(move |_| {
+            // For each chunk
+            chunk.iter().for_each(|blocknum| {
+                let hash = cl.get_block_hash(blocknum.to_owned()).unwrap();
                 let block = cl.get_block(&hash).unwrap();
-
-                on_block(s1, block, ctx);
-
-                if (blocknum % 100) == 0 {
-                    info!("Processed block {}", blocknum);
-                }
+                let block = on_block(block);
             });
+
+            processed.fetch_add(chunk.len(), Ordering::SeqCst);
+            info!("Processed {}/{} blocks.", processed.load(Ordering::SeqCst), blocks);
         });
     });
 }
 
-fn on_block<'a>(scope: &rayon::Scope<'a>, block: bitcoin::Block, ctx: Arc<RwLock<Context>>) {
+fn on_block<'a>(block: bitcoin::Block) -> Block {
+    let mut block_result = Block::new(block.block_hash().to_string());
     let txdata = block.txdata;
     for tx in txdata {
-        let ctx = ctx.clone();
-        if !ctx
-            .read()
-            .unwrap()
-            .transactions
-            .contains(&Transaction::new(tx.txid().to_string()))
-        {
-            //scope.spawn(|s1| {
-            on_transaction(
-                // s1,
-                tx, ctx,
-            );
-            //})
-        }
+        let transaction = on_transaction(tx);
+        block_result.add_transaction(transaction);
     }
+
+    block_result
 }
 
-fn on_transaction<'a>(
-    // scope: &rayon::Scope<'a>,
-    tx: bitcoin::Transaction,
-    ctx: Arc<RwLock<Context>>,
-) {
-    let mut vouts: Vec<Vout> = Vec::new();
+fn on_transaction(tx: bitcoin::Transaction) -> Transaction {
+    let txid = tx.txid().to_string();
+    let mut transaction = Transaction::new(txid);
 
-    for (vout, output) in tx.output.iter().enumerate() {
-        let ctx = ctx.clone();
-        let txid = tx.txid().to_string();
-
+    for output in tx.output.iter() {
         match script_to_p2sh(&output.script_pubkey) {
             Ok(address) => {
                 //info!("Processed wallet addr: {}", address);
-                let vout = Vout::new(address, output.value);
-                vouts.push(vout);
+                let vout = Vout::VALID(address, output.value);
+                transaction.add_vout(vout);
             }
-            Err(e) => {
-                //error!(
-                //    "Script is not a valid address in transaction: {}; {}",
-                //    txid,
-                //    e
-                //);
+            Err(_) => {
+                transaction.add_vout(Vout::INVALID);
             }
         }
     }
 
-    ctx.write()
-        .unwrap()
-        .add_transaction_vouts(tx.txid().to_string(), vouts);
+    transaction
 }
 
 fn script_to_p2sh(script: &bitcoin::Script) -> Result<String, String> {
@@ -211,12 +160,15 @@ fn script_to_p2sh(script: &bitcoin::Script) -> Result<String, String> {
         None => {
             // @TODO Attempt to parse the script manually
             //script_to_v0(script)
-            Err("Failed to parse script".to_string())
+            if script.is_p2pk() {
+                return script_to_p2pk(script);
+            }
+            return Err("Not a p2pk script".to_string());
         }
     }
 }
 
-fn script_to_v0(script: &bitcoin::Script) -> Result<String, String> {
+/***fn script_to_v0(script: &bitcoin::Script) -> Result<String, String> {
     if script.is_p2pk() {
         return script_to_p2pk(script);
     } else {
@@ -230,7 +182,7 @@ fn script_to_v0(script: &bitcoin::Script) -> Result<String, String> {
             is_p2pk, is_p2pkh, is_p2sh, is_v0_p2wpkh, is_v0_p2wsh
         ));
     }
-}
+}**/
 
 fn script_to_p2pk(script: &bitcoin::Script) -> Result<String, String> {
     let pubsig: Option<&[u8]> = script
