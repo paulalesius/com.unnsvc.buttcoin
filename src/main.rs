@@ -121,11 +121,18 @@ fn main() {
     // Create dir to store data in
     std::fs::create_dir_all("target/data").unwrap();
 
+    // Parse cmdline args
+    let args: Vec<String> = env::args().collect();
+    info!("Args ({}): {:?}", args.len(), args);
+    let arg_threads = args[1].parse::<usize>().unwrap();
+    let arg_threshold = args[2].parse::<u64>().unwrap();
+    let arg_chunksize = args[3].parse::<u64>().unwrap();
+
     let user = env::var("BITCOINRPC_USER").unwrap().to_string();
     let pass = env::var("BITCOINRPC_PASS").unwrap().to_string();
     let url = env::var("BITCOINRPC_URL").unwrap().to_string();
     let pool = &rayon::ThreadPoolBuilder::new()
-        .num_threads(8)
+        .num_threads(arg_threads)
         .build()
         .unwrap();
 
@@ -133,7 +140,7 @@ fn main() {
     let cl = bitcoin::Client::new(url, auth).unwrap();
     let total_blocks = cl.get_blockchain_info().unwrap().blocks;
     let blocknums = (0..total_blocks).collect::<Vec<u64>>();
-    let ctx = Arc::new(Context::new(total_blocks, 8000000, 100, 3000000));
+    let ctx = Arc::new(Context::new(total_blocks, arg_threshold, arg_chunksize));
 
     pool.scope(|scope| {
         with_scope(scope, &cl, &blocknums, ctx);
@@ -159,7 +166,6 @@ impl Context {
         total_blocks: u64,
         segment_transactions_flush_threshold: u64,
         chunk_size: u64,
-        wallets_flush_threshold: u64,
     ) -> Self {
         Context {
             nr_total_blocks: total_blocks,
@@ -291,6 +297,7 @@ fn with_scope<'a>(
                 let start_flush = Instant::now();
                 let segment: Option<Segment> =  ctx.add_blocks_and_flush(processed_blocks_local, processed_transactions as u64);
                 if let Some(ref segment) = segment {
+
                     let file = File::create(format!("target/data/blocks-{}.dat", segment.id)).expect("Failed to create file");
                     let writer = BufWriter::new(file);
                     bincode::serialize_into(writer, segment).expect("Failed to serialize");
@@ -303,6 +310,7 @@ fn with_scope<'a>(
                 let start_wallets = Instant::now();
                 let mut flushed_wallets = 0;
                 if let Some(ref segment) = segment {
+
                     let wallets: Vec<Wallet> = ctx.wallets.write().unwrap().drain().collect();
                     let file = File::create(format!("target/data/wallets-{}.dat", segment.id)).expect("Failed to create file");
                     let writer = BufWriter::new(file);
