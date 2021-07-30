@@ -1,0 +1,8 @@
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/install/strip.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/install/local.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/install.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/list_install_components.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/rebuild_cache.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/leveldbutil.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/edit_cache.dir
+/usr/src/com.unnsvc/com.unnsvc.buttcoin/bitcoindb/target/debug/build/leveldb-sys-b3eebc4395745c99/out/build/CMakeFiles/leveldb.dir
